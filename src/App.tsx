@@ -5,7 +5,7 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { GoogleGenAI } from "@google/genai";
-import { Terminal, AlertTriangle, Shield, Zap, Navigation, Clock, Send, RotateCcw } from 'lucide-react';
+import { Terminal, AlertTriangle, Shield, Zap, Navigation, Clock, Send, RotateCcw, Volume2, VolumeX } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import Markdown from 'react-markdown';
 import { clsx, type ClassValue } from 'clsx';
@@ -15,7 +15,7 @@ function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-const GAME_TIME_LIMIT = 600; // 3 minutes
+const GAME_TIME_LIMIT = 600; // 10 minutes
 
 const SYSTEM_INSTRUCTION = `
 You are AURA, a ship AI. The ship has 3 critical failures.
@@ -67,10 +67,37 @@ export default function App() {
   const [victory, setVictory] = useState(false);
   const [loading, setLoading] = useState(false);
   const [currentSystemData, setCurrentSystemData] = useState<any>(null);
+  const [voiceEnabled, setVoiceEnabled] = useState(false);
+  const [voiceSupported, setVoiceSupported] = useState(true);
+  const [difficulty, setDifficulty] = useState<'EASY' | 'STANDARD' | 'HARD' | null>(null);
+
+  const STORAGE_KEY = 'aura_system_statuses';
+  const defaultSystemStatuses = {
+    PROPULSION: 'CRITICAL',
+    'LIFE SUPPORT': 'CRITICAL',
+    NAVIGATION: 'CRITICAL',
+  } as const;
+
+  const loadStatuses = () => {
+    if (typeof window === 'undefined') return { ...defaultSystemStatuses };
+    try {
+      const stored = localStorage.getItem(STORAGE_KEY);
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        return { ...defaultSystemStatuses, ...parsed };
+      }
+    } catch (e) {
+      console.warn('Failed to load system statuses', e);
+    }
+    return { ...defaultSystemStatuses };
+  };
+
+  const [systemStatuses, setSystemStatuses] = useState<Record<string, string>>(() => loadStatuses());
 
   const chatRef = useRef<any>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
+  const spokenRef = useRef<string>('');
 
   // Initialize AI
   const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
@@ -80,6 +107,87 @@ export default function App() {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [messages]);
+
+  useEffect(() => {
+    // Detect browser TTS support once on mount
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
+      setVoiceSupported(false);
+    }
+    return () => {
+      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+      }
+    };
+  }, []);
+
+  const cleanSpeechText = (text: string) => {
+    return text
+      .replace(/```[\s\S]*?```/g, '') // strip fenced code blocks
+      .replace(/[`*_>#-]/g, '') // remove markdown noise
+      .replace(/\s+/g, ' ') // collapse whitespace
+      .trim();
+  };
+
+  const persistStatuses = (next: Record<string, string>) => {
+    if (typeof window === 'undefined') return;
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+    } catch (e) {
+      console.warn('Failed to persist statuses', e);
+    }
+  };
+
+  const updateSystemStatus = (system: string, status: string) => {
+    const key = system.toUpperCase();
+    const value = status.toUpperCase();
+    setSystemStatuses((prev) => {
+      const next = { ...prev, [key]: value };
+      persistStatuses(next);
+      return next;
+    });
+  };
+
+  const applyStatusesFromData = (data: any) => {
+    if (!data) return;
+    if (Array.isArray(data)) {
+      data.forEach(applyStatusesFromData);
+      return;
+    }
+    if (data.system && data.status) {
+      updateSystemStatus(String(data.system), String(data.status));
+    }
+    if (data.name && data.status) {
+      updateSystemStatus(String(data.name), String(data.status));
+    }
+    if (Array.isArray(data.systems)) {
+      data.systems.forEach((entry: any) => applyStatusesFromData(entry));
+    }
+    if (typeof data === 'object') {
+      Object.values(data).forEach((value) => {
+        if (typeof value === 'object') applyStatusesFromData(value);
+      });
+    }
+  };
+
+  const speakText = (text: string) => {
+    if (!voiceEnabled || !voiceSupported || typeof window === 'undefined') return;
+    const utterance = new SpeechSynthesisUtterance(cleanSpeechText(text));
+    utterance.rate = 1.25; // slightly faster narration
+    utterance.pitch = 1;
+    utterance.volume = 1;
+    window.speechSynthesis.cancel();
+    window.speechSynthesis.speak(utterance);
+  };
+
+  useEffect(() => {
+    if (!voiceEnabled || loading || !messages.length) return;
+    const last = messages[messages.length - 1];
+    if (last.role !== 'model') return;
+    const text = last.text.trim();
+    if (!text || text === spokenRef.current) return;
+    spokenRef.current = text;
+    speakText(text);
+  }, [messages, voiceEnabled, loading]);
 
   const extractJson = (text: string) => {
     const jsonMatch = text.match(/```json\n([\s\S]*?)\n```/);
@@ -102,6 +210,7 @@ export default function App() {
     setTimeLeft(GAME_TIME_LIMIT);
     setMessages([]);
     setCurrentSystemData(null);
+    setSystemStatuses(loadStatuses());
 
     try {
       const chat = ai.chats.create({
@@ -112,7 +221,9 @@ export default function App() {
       });
       chatRef.current = chat;
 
-      const stream = await chat.sendMessageStream({ message: "INITIALIZE. LIST ACTIVE ALERTS ONLY." });
+      const stream = await chat.sendMessageStream({
+        message: `INITIALIZE. Respond ONLY with the three systems and their status, each on a new line, exactly:\nPROPULSION - STATUS: CRITICAL\nLIFE SUPPORT - STATUS: CRITICAL\nNAVIGATION - STATUS: CRITICAL\nDo not list any other systems. Do not show JSON until requested. Difficulty: ${difficulty}.`
+      });
       
       setMessages([{ role: 'model', text: '' }]);
       
@@ -123,7 +234,10 @@ export default function App() {
       }
       
       const extracted = extractJson(fullText);
-      if (extracted) setCurrentSystemData(extracted);
+      if (extracted) {
+        setCurrentSystemData(extracted);
+        applyStatusesFromData(extracted);
+      }
       
       startTimer();
     } catch (error) {
@@ -165,7 +279,7 @@ export default function App() {
 
     try {
       const stream = await chatRef.current.sendMessageStream({ 
-        message: `USER COMMAND: ${userMsg}. (Time remaining: ${timeLeft}s)` 
+        message: `USER COMMAND: ${userMsg}. (Time remaining: ${timeLeft}s, Difficulty: ${difficulty}).` 
       });
       
       // Add an empty model message to start streaming into
@@ -182,7 +296,10 @@ export default function App() {
       }
 
       const extracted = extractJson(fullText);
-      if (extracted) setCurrentSystemData(extracted);
+      if (extracted) {
+        setCurrentSystemData(extracted);
+        applyStatusesFromData(extracted);
+      }
 
       if (fullText.toUpperCase().includes("MISSION SUCCESS")) {
         endGame(true);
@@ -241,6 +358,28 @@ export default function App() {
             <Clock className="w-4 h-4" />
             <span className="text-xl font-bold tabular-nums">{formatTime(timeLeft)}</span>
           </div>
+          <button
+            type="button"
+            onClick={() => setVoiceEnabled((v) => {
+              const next = !v;
+              if (next) spokenRef.current = '';
+              if (!next && typeof window !== 'undefined' && 'speechSynthesis' in window) {
+                window.speechSynthesis.cancel();
+              }
+              return next;
+            })}
+            disabled={!voiceSupported}
+            className={cn(
+              "flex items-center gap-2 px-3 py-2 rounded-md border text-xs transition-colors",
+              voiceEnabled
+                ? "border-[#00ff41]/60 text-[#00ff41] bg-[#00ff41]/10"
+                : "border-white/10 text-white/70 bg-white/5",
+              !voiceSupported && "opacity-40 cursor-not-allowed"
+            )}
+          >
+            {voiceEnabled ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4" />}
+            <span>{voiceSupported ? (voiceEnabled ? "Audio On" : "Audio Off") : "No TTS"}</span>
+          </button>
         </div>
       </header>
 
